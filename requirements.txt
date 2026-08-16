@@ -6,3 +6,5 @@ requests==2.31.0
 beautifulsoup4==4.12.3
 python-whois==0.9.4
 pydantic==2.6.4
+androguard==4.1.4
+python-multipart==0.0.9
