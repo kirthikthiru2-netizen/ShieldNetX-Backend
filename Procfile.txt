@@ -1,1 +1,162 @@
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
+package com.shieldnetx.ui;
+
+import android.animation.ArgbEvaluator;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.view.View;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.shieldnetx.R;
+import com.shieldnetx.network.ThreatApiClient;
+
+public class ThreatWarningActivity extends AppCompatActivity {
+
+    public static final String EXTRA_URL    = "extra_url";
+    public static final String EXTRA_SCORE  = "extra_score";
+    public static final String EXTRA_REASON = "extra_reason";
+
+    private String interceptedUrl;
+    private int threatScore;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_threat_warning);
+
+        interceptedUrl = getIntent().getStringExtra(EXTRA_URL);
+        threatScore    = getIntent().getIntExtra(EXTRA_SCORE, 0);
+        String reason  = getIntent().getStringExtra(EXTRA_REASON);
+
+        // Vibrate
+        Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+        if (vibrator != null && vibrator.hasVibrator()) {
+            vibrator.vibrate(VibrationEffect.createWaveform(
+                    new long[]{0, 300, 100, 300}, -1));
+        }
+
+        TextView      tvWarningIcon = findViewById(R.id.tv_warning_icon);
+        TextView      tvUrl         = findViewById(R.id.tv_url);
+        TextView      tvScore       = findViewById(R.id.tv_score);
+        TextView      tvReason      = findViewById(R.id.tv_reason);
+        TextView      tvRiskLabel   = findViewById(R.id.tv_risk_label);
+        ScoreRingView scoreRing     = findViewById(R.id.score_ring);
+        LinearLayout  scoreCard     = findViewById(R.id.score_card);
+        Button        btnGoBack     = findViewById(R.id.btn_go_back);
+        Button        btnProceed    = findViewById(R.id.btn_proceed);
+
+        tvUrl.setText(truncateUrl(interceptedUrl));
+        tvReason.setText(reason != null ? reason : "Multiple threat signals detected");
+
+        int finalColor = ScoreRingView.interpolateColor(threatScore);
+
+        // Set static fields immediately (labels, reason)
+        tvRiskLabel.setText(getRiskLabel(threatScore));
+        tvRiskLabel.setTextColor(finalColor);
+
+        // --- Score count-up + live color interpolation ---
+        ValueAnimator countUp = ValueAnimator.ofInt(0, threatScore);
+        countUp.setDuration(1400);
+        countUp.setInterpolator(new DecelerateInterpolator());
+        countUp.addUpdateListener(anim -> {
+            int val = (int) anim.getAnimatedValue();
+            int liveColor = ScoreRingView.interpolateColor(val);
+            tvScore.setText(String.valueOf(val));
+            tvScore.setTextColor(liveColor);
+            scoreRing.setProgress(val, liveColor);
+        });
+        countUp.start();
+
+        // --- Card slide-up + overshoot entrance ---
+        scoreCard.setTranslationY(120f);
+        scoreCard.setAlpha(0f);
+        scoreCard.animate()
+                .translationY(0f)
+                .alpha(1f)
+                .setDuration(500)
+                .setInterpolator(new OvershootInterpolator(1.2f))
+                .setStartDelay(100)
+                .start();
+
+        // --- Warning icon pulse ---
+        ObjectAnimator pulseX = ObjectAnimator.ofFloat(tvWarningIcon, "scaleX", 1f, 1.25f, 1f);
+        ObjectAnimator pulseY = ObjectAnimator.ofFloat(tvWarningIcon, "scaleY", 1f, 1.25f, 1f);
+        for (ObjectAnimator p : new ObjectAnimator[]{pulseX, pulseY}) {
+            p.setDuration(700);
+            p.setRepeatCount(3);
+            p.setRepeatMode(ValueAnimator.REVERSE);
+            p.start();
+        }
+
+        // --- Background tint shift (subtle, dark → slightly tinted for critical scores) ---
+        if (threatScore >= 70) {
+            int fromColor = Color.parseColor("#0D0D0D");
+            int toColor   = threatScore >= 85
+                    ? Color.parseColor("#1A0505")
+                    : Color.parseColor("#150A00");
+            View root = findViewById(android.R.id.content);
+            ValueAnimator bgAnim = ValueAnimator.ofObject(new ArgbEvaluator(), fromColor, toColor);
+            bgAnim.setDuration(1200);
+            bgAnim.addUpdateListener(a -> root.setBackgroundColor((int) a.getAnimatedValue()));
+            bgAnim.start();
+        }
+
+        btnGoBack.setOnClickListener(v -> {
+            finish();
+            overridePendingTransition(0, android.R.anim.fade_out);
+        });
+
+        btnProceed.setOnClickListener(v -> {
+            openUrlInBrowser(interceptedUrl);
+            finish();
+        });
+
+        triggerGuardianAlert();
+    }
+
+    private String getRiskLabel(int score) {
+        if (score >= 85) return "⛔ CRITICAL RISK";
+        if (score >= 70) return "🔴 HIGH RISK";
+        if (score >= 50) return "🟠 MEDIUM RISK";
+        return "🟡 LOW RISK";
+    }
+
+    private void triggerGuardianAlert() {
+        SharedPreferences prefs = getSharedPreferences("shieldnetx_prefs", MODE_PRIVATE);
+        String guardianPhone = prefs.getString("guardian_phone", null);
+        if (guardianPhone == null || guardianPhone.isEmpty()) return;
+        // Silent — Twilio backend only, no WhatsApp popup
+        ThreatApiClient.sendGuardianAlert(interceptedUrl, threatScore, guardianPhone);
+    }
+
+    private void openUrlInBrowser(String url) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception ignored) {}
+    }
+
+    private String truncateUrl(String url) {
+        if (url == null) return "Unknown URL";
+        return url.length() > 60 ? url.substring(0, 57) + "..." : url;
+    }
+
+    @Override
+    public void onBackPressed() {
+        super.onBackPressed();
+        finish();
+    }
+}

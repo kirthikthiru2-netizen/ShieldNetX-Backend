@@ -10,6 +10,7 @@ from feature_extractor import FeatureExtractor
 from model import ThreatScoringModel
 from apk_feature_extractor import APKFeatureExtractor
 from apk_model import ApkThreatScoringModel
+from twilio.rest import Client
 
 app = FastAPI(title="ShieldNetX ML Backend", version="2.1-ml")
 
@@ -29,6 +30,12 @@ apk_model = ApkThreatScoringModel()
 print("[STARTUP] Ready!")
 
 MAX_APK_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB safety cap
+
+# Twilio config — pulled from environment, never hardcoded
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE = os.environ.get("TWILIO_PHONE")
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # ── Request / Response Models ─────────────────────────────────────────────────
 
@@ -217,13 +224,23 @@ async def analyze_apk(file: UploadFile = File(...)):
 
 @app.post("/guardian-alert")
 def guardian_alert(req: GuardianAlertRequest):
-    print(f"[GUARDIAN] Phone={req.guardian_phone} "
-          f"URL={req.blocked_url} Score={req.threat_score}")
-    return {
-        "status": "alert_sent",
-        "message": f"Guardian alerted about threat score {req.threat_score}",
-        "phone": req.guardian_phone,
-    }
+    print(f"[GUARDIAN] Phone={req.guardian_phone} URL={req.blocked_url} Score={req.threat_score}")
+    try:
+        message = twilio_client.messages.create(
+            body=(
+                f"🚨 ShieldNetX Alert: A phishing link was blocked on the protected device.\n\n"
+                f"URL: {req.blocked_url}\n"
+                f"Threat Score: {req.threat_score}/100\n\n"
+                f"No action needed — the link was automatically blocked."
+            ),
+            from_=TWILIO_PHONE,
+            to=req.guardian_phone
+        )
+        print(f"[GUARDIAN] SMS sent: {message.sid}")
+        return {"status": "alert_sent", "message_sid": message.sid}
+    except Exception as e:
+        print(f"[GUARDIAN] SMS failed: {e}")
+        return {"status": "failed", "error": str(e)}
 
 
 @app.get("/test")
