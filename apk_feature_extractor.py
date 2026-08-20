@@ -1,148 +1,170 @@
-import re
-import requests
-import socket
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
-import whois
-from datetime import datetime
+from androguard.core.apk import APK
 
-class FeatureExtractor:
 
-    SUSPICIOUS_DOMAINS = [
-        "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly",
-        "rb.gy", "cutt.ly", "shorturl.at", "tiny.cc",
-    ]
+DANGEROUS_PERMISSIONS = {
+    "android.permission.READ_SMS",
+    "android.permission.SEND_SMS",
+    "android.permission.RECEIVE_SMS",
+    "android.permission.READ_CONTACTS",
+    "android.permission.WRITE_CONTACTS",
+    "android.permission.CALL_PHONE",
+    "android.permission.READ_CALL_LOG",
+    "android.permission.CAMERA",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.BIND_ACCESSIBILITY_SERVICE",
+    "android.permission.BIND_DEVICE_ADMIN",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.READ_PHONE_STATE",
+}
 
-    KNOWN_MALICIOUS = [
-        "testsafebrowsing.appspot.com", "go2jump.org",
-        "cpabounty.go2jump.org", "malware.wicar.org",
-        "phishtank.com", "eicar.org",
-    ]
+KNOWN_APP_NAMES = {
+    "whatsapp", "facebook", "instagram", "gmail", "google play",
+    "chrome", "youtube", "paytm", "phonepe", "google pay",
+    "amazon", "flipkart", "sbi", "hdfc", "icici bank",
+}
 
-    PHISHING_KEYWORDS = [
-        "verify", "suspended", "urgent", "confirm", "login-secure",
-        "banking", "paypal", "amazon-", "apple-id", "free-gift",
-        "claim-now", "you-won", "kyc", "otp", "aadhar", "pan-verify",
-        "refund", "phishing", "malware", "update-account",
-    ]
+SUSPICIOUS_CODE_STRINGS = [
+    "DexClassLoader", "PathClassLoader", "loadClass",
+    "Runtime.exec", "ProcessBuilder", "reflect.Method.invoke",
+    "getSystemService(\"device_policy\")", "su\n", "/system/bin/su",
+]
 
-    GAMBLING_KEYWORDS = [
-        "betway", "bet365", "poker", "casino", "slots",
-        "lottery", "jackpot", "winning", "prize", "gamble",
-    ]
 
-    TRUSTED_DOMAINS = [
-        "google.com", "youtube.com", "github.com", "wikipedia.org",
-        "microsoft.com", "apple.com", "amazon.com", "linkedin.com",
-        "twitter.com", "instagram.com", "facebook.com",
-    ]
+class APKFeatureExtractor:
 
-    def extract(self, url: str, source_app: str = "unknown",
-                unknown_sender: bool = False) -> dict:
-        features = {}
-        url_lower = url.lower()
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
+    def extract(self, apk_path: str) -> dict:
+        features = {name: 0 for name in [
+            "is_unparseable", "is_signed", "has_modern_signature",
+            "v1_only_signature", "is_debuggable", "allows_backup",
+            "min_sdk_low", "dangerous_permission_count",
+            "has_sms_permissions", "has_install_packages_permission",
+            "has_overlay_permission", "has_accessibility_permission",
+            "has_device_admin_permission", "has_contacts_permission",
+            "has_trojan_permission_combo", "total_permission_count",
+            "mimics_known_app_name", "component_count", "multidex",
+            "suspicious_code_string_hits", "uses_dynamic_code_loading",
+            "uses_native_libs", "has_launcher_icon",
+        ]}
 
-        # ── Signal 1: URL Structure Analysis ─────────────────────────
-        features["is_shortener"] = int(
-            any(s in url_lower for s in self.SUSPICIOUS_DOMAINS))
-        features["is_known_malicious"] = int(
-            any(m in url_lower for m in self.KNOWN_MALICIOUS))
-        features["has_phishing_keyword"] = int(
-            any(k in url_lower for k in self.PHISHING_KEYWORDS))
-        features["has_gambling_keyword"] = int(
-            any(k in url_lower for k in self.GAMBLING_KEYWORDS))
-        features["is_trusted_domain"] = int(
-            any(t in url_lower for t in self.TRUSTED_DOMAINS))
-        features["url_length"] = min(len(url) / 200.0, 1.0)
-        features["has_ip_address"] = int(
-            bool(re.search(r'\d+\.\d+\.\d+\.\d+', domain)))
-        features["has_at_symbol"] = int("@" in url)
-        features["has_double_slash"] = int(url.count("//") > 1)
-        features["subdomain_count"] = min(domain.count(".") / 5.0, 1.0)
-        features["has_https"] = int(url.startswith("https://"))
-        features["has_suspicious_tld"] = int(
-            any(domain.endswith(t) for t in [
-                ".tk", ".ml", ".ga", ".cf", ".gq", ".xyz",
-                ".top", ".click", ".download", ".loan"]))
-
-        # ── Signal 2: Sender Trust ────────────────────────────────────
-        features["unknown_sender"] = int(unknown_sender)
-        features["from_messaging_app"] = int(
-            any(app in source_app for app in [
-                "whatsapp", "telegram", "instagram", "sms"]))
-
-        # ── Signal 3: HTML Analysis ───────────────────────────────────
-        html_features = self._analyze_html(url)
-        features.update(html_features)
-
-        # ── Signal 4: Domain Age ──────────────────────────────────────
-        features["domain_age_score"] = self._get_domain_age_score(domain)
-
-        return features
-
-    def _analyze_html(self, url: str) -> dict:
-        result = {
-            "has_password_field": 0,
-            "has_hidden_fields": 0,
-            "has_suspicious_js": 0,
-            "external_links_ratio": 0.0,
-            "has_favicon_mismatch": 0,
-            "page_load_failed": 0,
-        }
         try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(url, timeout=4, headers=headers,
-                                allow_redirects=True)
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Password fields
-            result["has_password_field"] = int(
-                bool(soup.find("input", {"type": "password"})))
-
-            # Hidden fields
-            hidden = soup.find_all("input", {"type": "hidden"})
-            result["has_hidden_fields"] = int(len(hidden) > 3)
-
-            # Suspicious JS patterns
-            scripts = " ".join(
-                s.string or "" for s in soup.find_all("script"))
-            suspicious_js = [
-                "eval(", "document.write(", "window.location",
-                "unescape(", "fromCharCode", "atob(",
-            ]
-            result["has_suspicious_js"] = int(
-                any(p in scripts for p in suspicious_js))
-
-            # External links ratio
-            all_links = soup.find_all("a", href=True)
-            if all_links:
-                parsed_host = urlparse(url).netloc
-                external = sum(
-                    1 for a in all_links
-                    if parsed_host not in a["href"]
-                    and a["href"].startswith("http")
-                )
-                result["external_links_ratio"] = min(
-                    external / len(all_links), 1.0)
-
+            apk = APK(apk_path)
         except Exception:
-            result["page_load_failed"] = 1
+            features["is_unparseable"] = 1
+            return features
 
-        return result
-
-    def _get_domain_age_score(self, domain: str) -> float:
+        # ── Signing ──────────────────────────────────────────────
         try:
-            w = whois.whois(domain)
-            creation = w.creation_date
-            if isinstance(creation, list):
-                creation = creation[0]
-            if creation:
-                age_days = (datetime.now() - creation).days
-                # New domain (< 30 days) = suspicious score 1.0
-                # Old domain (> 365 days) = safe score 0.0
-                return max(0.0, 1.0 - (age_days / 365.0))
+            v1 = apk.is_signed_v1()
+            v2 = apk.is_signed_v2()
+            v3 = apk.is_signed_v3()
+            features["is_signed"] = int(v1 or v2 or v3)
+            features["has_modern_signature"] = int(v2 or v3)
+            features["v1_only_signature"] = int(v1 and not (v2 or v3))
         except Exception:
             pass
-        return 0.5  # unknown = neutral
+
+        # ── Manifest flags ───────────────────────────────────────
+        try:
+            features["is_debuggable"] = int(bool(apk.get_attribute_value(
+                "application", "debuggable")))
+        except Exception:
+            pass
+
+        try:
+            allow_backup = apk.get_attribute_value("application", "allowBackup")
+            # AndroidManifest defaults allowBackup to true when unset
+            features["allows_backup"] = int(allow_backup != "false")
+        except Exception:
+            features["allows_backup"] = 1
+
+        try:
+            min_sdk = int(apk.get_min_sdk_version() or 21)
+            features["min_sdk_low"] = int(min_sdk < 21)
+        except Exception:
+            pass
+
+        # ── Permissions ──────────────────────────────────────────
+        try:
+            perms = set(apk.get_permissions())
+            features["total_permission_count"] = len(perms)
+            dangerous = perms & DANGEROUS_PERMISSIONS
+            features["dangerous_permission_count"] = len(dangerous)
+
+            has_sms = any("SMS" in p for p in perms)
+            has_install = "android.permission.REQUEST_INSTALL_PACKAGES" in perms
+            has_overlay = "android.permission.SYSTEM_ALERT_WINDOW" in perms
+            has_accessibility = "android.permission.BIND_ACCESSIBILITY_SERVICE" in perms
+            has_device_admin = "android.permission.BIND_DEVICE_ADMIN" in perms
+            has_contacts = any("CONTACTS" in p for p in perms)
+
+            features["has_sms_permissions"] = int(has_sms)
+            features["has_install_packages_permission"] = int(has_install)
+            features["has_overlay_permission"] = int(has_overlay)
+            features["has_accessibility_permission"] = int(has_accessibility)
+            features["has_device_admin_permission"] = int(has_device_admin)
+            features["has_contacts_permission"] = int(has_contacts)
+
+            # Classic banking-trojan pattern: SMS + (overlay or install)
+            features["has_trojan_permission_combo"] = int(
+                has_sms and (has_overlay or has_install))
+        except Exception:
+            pass
+
+        # ── Identity / mimicry ───────────────────────────────────
+        try:
+            app_name = (apk.get_app_name() or "").strip().lower()
+            features["mimics_known_app_name"] = int(
+                any(known in app_name for known in KNOWN_APP_NAMES)
+            )
+        except Exception:
+            pass
+
+        # ── Components ───────────────────────────────────────────
+        try:
+            activities = apk.get_activities() or []
+            services = apk.get_services() or []
+            receivers = apk.get_receivers() or []
+            providers = apk.get_providers() or []
+            features["component_count"] = (
+                len(activities) + len(services) + len(receivers) + len(providers)
+            )
+        except Exception:
+            pass
+
+        try:
+            main_activity = apk.get_main_activity()
+            features["has_launcher_icon"] = int(bool(main_activity))
+        except Exception:
+            pass
+
+        # ── Code structure ───────────────────────────────────────
+        try:
+            dex_files = [f for f in apk.get_files() if f.endswith(".dex")]
+            features["multidex"] = int(len(dex_files) > 1)
+        except Exception:
+            pass
+
+        try:
+            libs = apk.get_libraries() if hasattr(apk, "get_libraries") else []
+            native_libs = [f for f in apk.get_files() if f.startswith("lib/")]
+            features["uses_native_libs"] = int(
+                bool(libs) or bool(native_libs))
+        except Exception:
+            pass
+
+        try:
+            all_strings = " ".join(apk.get_files())
+            hits = sum(
+                1 for s in SUSPICIOUS_CODE_STRINGS if s in all_strings)
+            features["suspicious_code_string_hits"] = hits
+            features["uses_dynamic_code_loading"] = int(
+                "DexClassLoader" in all_strings or "PathClassLoader" in all_strings)
+        except Exception:
+            pass
+
+        return features
